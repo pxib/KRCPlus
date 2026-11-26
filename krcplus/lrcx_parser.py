@@ -1,0 +1,386 @@
+import re
+import json
+from io import StringIO
+
+from .models import LyricLine, LyricSegment
+from .line_breaks import decode_line_breaks
+from .formatting import parse_emphasis, parse_quote_prefix
+from .parser import GENERATION_MODE_RE, normalize_generation_mode
+from .reading_groups import valid_reading_groups
+
+
+LINE_TIMESTAMP_RE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
+SEGMENT_TIMESTAMP_RE = re.compile(r"<(\d+):(\d+(?:\.\d+)?)>")
+INSTANT_TAG = "<instant>"
+RUBY_TOKEN_RE = re.compile(r"\{([^|{}]+)\|([^{}]+)\}")
+KARAOKE_TOKEN_RE = re.compile(f"{RUBY_TOKEN_RE.pattern}|{SEGMENT_TIMESTAMP_RE.pattern}")
+METADATA_RE = re.compile(r"^\[[A-Za-z][A-Za-z0-9_]*:.*\]$")
+OFFSET_RE = re.compile(r"^\[offset:([+-]?\d+(?:\.\d+)?)\]$", re.IGNORECASE)
+
+
+def get_lrcx_generation_mode(path):
+    """Return the document-level generated-reading mode stored as [g:mode]."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as file:
+            for raw_line in file:
+                match = GENERATION_MODE_RE.match(raw_line.strip())
+                if match:
+                    return normalize_generation_mode(match.group(1))
+    except OSError:
+        pass
+    return None
+
+
+def get_lrcx_offset(path):
+    """Return the LRCX playback offset in milliseconds."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as file:
+            for raw_line in file:
+                match = OFFSET_RE.match(raw_line.strip())
+                if match:
+                    return float(match.group(1))
+    except OSError:
+        pass
+    return 0.0
+
+
+def _timestamp(match):
+    return int(match.group(1)) * 60 + float(match.group(2))
+
+
+def parse_mora_reading(reading, start):
+    """Return clean ruby text and its cues, with a pair at each pause."""
+    parts = []
+    cues = []
+    cursor = offset = 0
+    previous = start
+    valid = True
+    for match in SEGMENT_TIMESTAMP_RE.finditer(reading):
+        part = reading[cursor:match.start()]
+        parts.append(part)
+        offset += len(part)
+        timestamp = _timestamp(match)
+        if not cues and not part:
+            valid = timestamp >= start
+        else:
+            # Two tags at an interior boundary mark its end and next onset.
+            pause = offset > 0 and (len(cues) < 2 or cues[-2][0] != offset)
+            valid = valid and (bool(part) or pause) and timestamp > previous
+        cues.append((offset, timestamp - start))
+        previous = timestamp
+        cursor = match.end()
+    tail = reading[cursor:]
+    parts.append(tail)
+    return "".join(parts), tuple(cues) if valid and tail else ()
+
+
+def _parse_content(content, start_time, split_newlines=False):
+    """Parse one timed LRCX chunk, including structural newline markers."""
+    # LRCX uses the literal ``{\\n}`` token for an in-line visual newline.
+    # Convert it before ruby parsing, then split it back into structural
+    # segments so karaoke timestamps cannot accidentally become attached to
+    # the newline itself.
+    content = str(content or "").replace(r"{\n}", "\n")
+
+    text_parts = []
+    ruby_spans = []
+    position = 0
+    offset = 0
+
+    for match in RUBY_TOKEN_RE.finditer(content):
+        literal = content[position:match.start()]
+        if literal:
+            text_parts.append(literal)
+            offset += len(literal)
+        base = match.group(1)
+        reading = match.group(2)
+        text_parts.append(base)
+        ruby_spans.append((offset, offset + len(base), reading))
+        offset += len(base)
+        position = match.end()
+
+    tail = content[position:]
+    if tail:
+        text_parts.append(tail)
+
+    text = ''.join(text_parts)
+    if not text:
+        return []
+
+    # Plain LRCX keeps a visual newline inside the single lyric segment.
+    # Explicit karaoke needs structural newline segments so each following
+    # timed chunk can receive its own visual-line index.
+    if not split_newlines or "\n" not in text:
+        seg = LyricSegment(start=start_time, text=text)
+        if ruby_spans:
+            seg.ruby_spans = list(ruby_spans)
+            if len(ruby_spans) == 1 and ruby_spans[0][:2] == (0, len(text)):
+                seg.ruby = ruby_spans[0][2]
+                seg.ruby_source = 'manual'
+        seg.visual_line = 0
+        return [seg]
+
+    result = []
+    visual_line = 0
+    cursor = 0
+    for part in text.splitlines(keepends=True):
+        is_newline = part == "\n"
+        if is_newline:
+            seg = LyricSegment(start=start_time, text="\n")
+            seg.visual_line = visual_line
+            result.append(seg)
+            visual_line += 1
+            cursor += 1
+            continue
+
+        visible = part[:-1] if part.endswith("\n") else part
+        if visible:
+            seg = LyricSegment(start=start_time, text=visible)
+            local_spans = []
+            for a, b, reading in ruby_spans:
+                overlap_a = max(a, cursor)
+                overlap_b = min(b, cursor + len(visible))
+                if overlap_a < overlap_b:
+                    local_spans.append((overlap_a - cursor, overlap_b - cursor, reading))
+            if local_spans:
+                seg.ruby_spans = local_spans
+                if len(local_spans) == 1 and local_spans[0][:2] == (0, len(visible)):
+                    seg.ruby = local_spans[0][2]
+                    seg.ruby_source = 'manual'
+            seg.visual_line = visual_line
+            result.append(seg)
+
+        cursor += len(visible)
+        if part.endswith("\n"):
+            seg = LyricSegment(start=start_time, text="\n")
+            seg.visual_line = visual_line
+            result.append(seg)
+            visual_line += 1
+            cursor += 1
+
+    return result
+
+
+def load_lrcx(path, *, infer_ends=True):
+    with open(path, "r", encoding="utf-8-sig") as file:
+        return parse_lrcx(file.read(), infer_ends=infer_ends)
+
+
+def parse_lrcx(text, *, infer_ends=True):
+    """Load LRCX v1.
+
+    Syntax:
+        [mm:ss.xxx]plain text{base|ruby}more text
+        [mm:ss.xxx]first chunk<mm:ss.xxx>next chunk
+
+    The line timestamp is the implicit timestamp for the first chunk. Ruby
+    annotations can appear anywhere inside a chunk and multiple annotations
+    may be adjacent without corrupting the surrounding lyric text.
+
+    Editors use infer_ends=False so a following line's timestamp remains a
+    dynamic fallback instead of becoming an authored terminal boundary.
+    """
+    lines = []
+    reading_groups = {}
+    line_ends = {}
+
+    with StringIO(text.lstrip("\ufeff")) as file:
+        for raw_line in file:
+            line = raw_line.rstrip("\r\n")
+            if line.startswith("[line_ends:") and line.endswith("]"):
+                try:
+                    value = json.loads(line[len("[line_ends:"):-1])
+                    if isinstance(value, dict):
+                        line_ends = value
+                except (ValueError, TypeError):
+                    pass
+                continue
+            if line.startswith("[reading_groups:") and line.endswith("]"):
+                try:
+                    value = json.loads(line[len("[reading_groups:"):-1])
+                    if isinstance(value, dict):
+                        reading_groups = value
+                except (ValueError, TypeError):
+                    pass
+                continue
+            if not line or METADATA_RE.match(line):
+                continue
+
+            line_matches = list(LINE_TIMESTAMP_RE.finditer(line))
+            if not line_matches:
+                continue
+
+            line_start = _timestamp(line_matches[0])
+            content = line[line_matches[-1].end():]
+            content, is_blockquote = parse_quote_prefix(content)
+            content, translation_lines = decode_line_breaks(content)
+            # Read the two token types in one pass so ruby cues cannot become
+            # karaoke chunk boundaries.
+            tokens = KARAOKE_TOKEN_RE.finditer(content)
+            segment_matches = []
+            has_mora_tags = False
+            for token in tokens:
+                if token.group(1) is None:
+                    segment_matches.append(SEGMENT_TIMESTAMP_RE.match(content, token.start()))
+                elif SEGMENT_TIMESTAMP_RE.search(token.group(2)):
+                    has_mora_tags = True
+            # Karaoke is explicit in LRCX: segment timestamps or instant tags.
+            has_karaoke = bool(segment_matches) or INSTANT_TAG in content or has_mora_tags
+            segments = []
+
+            if not segment_matches:
+                instant = content.startswith(INSTANT_TAG)
+                if instant:
+                    content = content[len(INSTANT_TAG):]
+                parsed = _parse_content(content, line_start, split_newlines=has_karaoke)
+                for segment in parsed:
+                    segment.instant = instant
+                segments.extend(parsed)
+            else:
+                # Leading content inherits the line timestamp.
+                leading = content[:segment_matches[0].start()]
+                instant = leading.startswith(INSTANT_TAG)
+                if instant:
+                    leading = leading[len(INSTANT_TAG):]
+                parsed = _parse_content(leading, line_start, split_newlines=has_karaoke)
+                for segment in parsed:
+                    segment.instant = instant
+                segments.extend(parsed)
+
+                for index, match in enumerate(segment_matches):
+                    text_start = match.end()
+                    text_end = (
+                        segment_matches[index + 1].start()
+                        if index + 1 < len(segment_matches)
+                        else len(content)
+                    )
+                    chunk = content[text_start:text_end]
+                    timestamp = _timestamp(match)
+
+                    # An empty timestamp between two chunks is an explicit end
+                    # boundary for the preceding chunk, allowing a real pause:
+                    #   word<00:01.000><00:02.000>next
+                    if not chunk and segments:
+                        # Multiple terminal boundaries can encode a segment
+                        # end followed by a later line end (a trailing pause).
+                        # Keep the first end on the segment itself.
+                        if segments[-1].end is None:
+                            segments[-1].end = timestamp
+                        continue
+
+                    instant = False
+                    if chunk.startswith(INSTANT_TAG):
+                        instant = True
+                        chunk = chunk[len(INSTANT_TAG):]
+
+                    parsed = _parse_content(chunk, timestamp, split_newlines=has_karaoke)
+                    for segment in parsed:
+                        segment.instant = instant
+                    segments.extend(parsed)
+
+            # Assign visual-line indices after all chunks for this lyric
+            # have been parsed. Timestamped chunks are parsed independently,
+            # so the index must carry across chunk boundaries.
+            visual_line = 0
+            for segment in segments:
+                segment.visual_line = visual_line
+                if segment.text == "\n":
+                    visual_line += 1
+
+            text = "".join(segment.text for segment in segments)
+            boundaries = []
+            boundary = 0
+            for segment in segments:
+                boundary += len(segment.text)
+                boundaries.append(boundary)
+            text, style_spans, offsets = parse_emphasis(text, boundaries)
+            source_offset = 0
+            visible_segments = []
+            formatting_end = None
+            for segment in segments:
+                source_end = source_offset + len(segment.text)
+                start = offsets[source_offset]
+                segment.text = text[start:offsets[source_end]]
+                segment.ruby_spans = [
+                    (offsets[source_offset + a] - start, offsets[source_offset + b] - start, reading)
+                    for a, b, reading in segment.ruby_spans
+                    if offsets[source_offset + a] < offsets[source_offset + b]
+                ]
+                if has_mora_tags:
+                    readings = []
+                    for a, b, raw_reading in segment.ruby_spans:
+                        reading, cues = parse_mora_reading(raw_reading, segment.start)
+                        if reading:
+                            readings.append((a, b, reading))
+                        if a == 0 and b == len(segment.text):
+                            segment.mora_cues = cues
+                    segment.ruby_spans = readings
+                    if segment.ruby is not None or segment.mora_cues:
+                        segment.ruby = (
+                            readings[0][2] if len(readings) == 1
+                            and readings[0][:2] == (0, len(segment.text)) else None
+                        )
+                        segment.ruby_source = "manual" if segment.ruby else None
+                source_offset = source_end
+                if segment.text:
+                    visible_segments.append(segment)
+                    formatting_end = None
+                elif visible_segments:
+                    if visible_segments[-1].end is None:
+                        visible_segments[-1].end = segment.start
+                    formatting_end = segment.start
+            segments = visible_segments
+
+            # A timestamp with no following lyric text is a terminal karaoke
+            # boundary, not an empty segment. Preserve it as the line ending.
+            explicit_end = formatting_end
+            if segment_matches:
+                last_match = segment_matches[-1]
+                trailing = content[last_match.end():]
+                if not trailing:
+                    explicit_end = _timestamp(last_match)
+                    if segments and segments[-1].end is None:
+                        segments[-1].end = explicit_end
+
+            lines.append(
+                LyricLine(
+                    start=line_start,
+                    text=text,
+                    segments=segments,
+                    end=explicit_end,
+                    has_karaoke=has_karaoke,
+                    style_spans=style_spans,
+                    is_blockquote=is_blockquote,
+                    translation_lines=translation_lines,
+                )
+            )
+
+    for index, lyric in enumerate(lines):
+        end_ms = line_ends.get(str(index))
+        if not lyric.has_karaoke and type(end_ms) is int and 0 <= end_ms < 10**15 and end_ms / 1000 >= lyric.start:
+            lyric.end = end_ms / 1000
+        entries = reading_groups.get(str(index), [])
+        candidates = []
+        for entry in entries if isinstance(entries, list) else []:
+            if (isinstance(entry, list) and len(entry) == 3
+                    and type(entry[0]) is int and type(entry[1]) is int
+                    and lyric.text[entry[0]:entry[1]] == entry[2]):
+                candidates.append(entry[:2])
+        lyric.reading_groups = valid_reading_groups(lyric.text, candidates)
+
+    # Keep document/source order intact. A lyric editor may intentionally have
+    # unfinished or newly marked timestamps that are out of chronological order.
+    # Sorting here changes the user's line priority.
+    #
+    # Natural karaoke ends still need chronological timing, so compute that
+    # relationship through a separate sorted index without moving `lines`.
+    timeline = sorted(
+        enumerate(lines),
+        key=lambda item: (item[1].start, item[0]),
+    )
+    for timeline_index, (original_index, lyric) in enumerate(timeline):
+        if infer_ends and lyric.end is None and timeline_index + 1 < len(timeline):
+            lyric.end = timeline[timeline_index + 1][1].start
+            lyric.end_inferred = True
+
+    return lines

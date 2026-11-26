@@ -1,0 +1,49 @@
+from pathlib import Path
+
+from .lrcx_parser import load_lrcx, get_lrcx_generation_mode
+from .models import LyricLine
+from .parser import load_lrc, get_lrc_generation_mode
+from .plain_ruby import load_plain_rows
+
+# Keep malformed subtitle imports from overwhelming the lyric list and reading
+# prefetch. The scrolling view separately bounds its widgets to the viewport.
+# Editors can still read the complete document with load_lyrics().
+PLAYER_LYRIC_LINE_LIMIT = 5000
+
+
+def load_lyrics(path, *, infer_ends=True):
+    """Load lyrics; editors can leave implicit ends unresolved while retiming."""
+    path = Path(path)
+
+    if path.suffix.lower() == ".lrcx":
+        return load_lrcx(path, infer_ends=infer_ends)
+
+    if path.suffix.lower() == ".lrc":
+        # Respect the declared document format even when an LRCX document was
+        # saved with the older .lrc extension.
+        with path.open("r", encoding="utf-8-sig") as file:
+            for raw_line in file:
+                header = raw_line.strip()
+                if header.lower() == "[format:lrcx]":
+                    return load_lrcx(path, infer_ends=infer_ends)
+                if header and not (header.startswith("[") and header[1:2].isalpha()):
+                    break
+        return [LyricLine(start=timestamp, text=text) for timestamp, text in load_lrc(path)]
+
+    if path.suffix.lower() == ".txt":
+        with open(path, "r", encoding="utf-8-sig") as file:
+            return load_plain_rows(file)
+
+    raise ValueError(f"Unsupported lyrics format: {path.suffix}")
+
+
+
+def get_lyrics_generation_mode(path):
+    """Return persisted generated-reading mode for an LRC/LRCX document."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".lrcx":
+        return get_lrcx_generation_mode(path)
+    if suffix == ".lrc":
+        return get_lrc_generation_mode(path)
+    return None

@@ -1,0 +1,7 @@
+PySide6>=6.8
+numpy
+sounddevice>=0.5
+Pillow
+mutagen>=1,<2
+requests>=2,<3
+pypinyin
